@@ -207,6 +207,23 @@ def count_elixir(emulator, elixir_count) -> bool:
     return False
 
 
+def read_current_elixir(emulator) -> int:
+    """Read the actual elixir count (1–10) from the elixir bar in one screenshot.
+
+    Scans from the highest pip down to the lowest; the first lit pip found is
+    the current elixir level.  Returns 0 if none of the pips are lit (bar not
+    visible or battle hasn't started yet).
+    """
+    iar = emulator.screenshot()
+    if iar is None:
+        return 0
+    for level in range(10, 0, -1):
+        row, col = ELIXIR_COORDS[level - 1]
+        if pixel_is_equal(iar[row, col], ELIXIR_COLOR, tol=65):
+            return level
+    return 0
+
+
 def check_pixels_for_win_in_battle_log(emulator) -> bool:
     """Method to check pixels that appear in the battle
     log to determine if the previous game was a win

@@ -45,6 +45,7 @@ from pyclashbot.bot.state_detect import (
     check_if_on_clash_main_menu,
     check_pixels_for_win_in_battle_log,
     count_elixir,
+    read_current_elixir,
 )
 from pyclashbot.bot.adaptive import get_session as _get_adaptive_session
 from pyclashbot.utils.logger import Logger
@@ -195,11 +196,114 @@ class CombatStateTracker:
         return ["push", "support", "spell", "defend"]
 
 
+# ---------------------------------------------------------------------------
+# Opponent activity tracker
+# ---------------------------------------------------------------------------
+
+import numpy as _numpy  # noqa: E402  (placed here to keep card_detection import-free)
+
+
+class OpponentActivityTracker:
+    """Monitors the opponent's side of the board for troop deployments.
+
+    Uses pixel-diff against a baseline screenshot (taken at fight start) to
+    detect when the opponent plays a card.  Also reads our own elixir to
+    inform play timing.
+
+    Attributes exposed to the fight loop
+    ------------------------------------
+    opponent_elixir_estimate : int
+        Rough estimate of how much elixir the opponent has built up since
+        their last deployment.  High value → they're about to do something
+        big; low value → they just spent and are vulnerable.
+    our_elixir : int
+        Our current elixir as of the last update() call.
+    deployments : list[float]
+        Wall-clock times of detected opponent deployments this match.
+    """
+
+    # Opponent arena region: rows 50–280, full width (419px).
+    # This covers the top half of the board where enemy troops appear.
+    _OPP_ROW_START = 50
+    _OPP_ROW_END = 280
+    _OPP_COL_START = 0
+    _OPP_COL_END = 419
+
+    # L2 norm above this → opponent deployed something new
+    _DEPLOY_THRESHOLD = 12000
+
+    # Elixir regenerates at ~1 per 2.8 s (normal), ~1 per 1.4 s (double elixir)
+    _ELIXIR_REGEN_NORMAL = 2.8
+    _ELIXIR_REGEN_DOUBLE = 1.4
+    # Double elixir starts at t=120 s
+    _DOUBLE_ELIXIR_START_S = 120.0
+
+    def __init__(self, baseline_screenshot: "_numpy.ndarray") -> None:
+        self._baseline = baseline_screenshot
+        self.deployments: list[float] = []
+        self.opponent_elixir_estimate: int = 5  # start neutral
+        self.our_elixir: int = 0
+        self._last_deploy_time: float = time.time()
+        self._cooldown_until: float = 0.0  # ignore detections for N seconds after one fires
+
+    def _opp_region(self, screenshot: "_numpy.ndarray") -> "_numpy.ndarray":
+        return screenshot[
+            self._OPP_ROW_START:self._OPP_ROW_END,
+            self._OPP_COL_START:self._OPP_COL_END,
+        ]
+
+    def update(self, emulator) -> None:
+        """Call once per play cycle.  Takes a screenshot and updates estimates."""
+        now = time.time()
+        screenshot = emulator.screenshot()
+        if screenshot is None:
+            return
+
+        # --- Our elixir ---
+        self.our_elixir = read_current_elixir(emulator)
+
+        # --- Opponent deployment detection ---
+        if now >= self._cooldown_until:
+            current_region = self._opp_region(screenshot).astype(_numpy.float32)
+            baseline_region = self._opp_region(self._baseline).astype(_numpy.float32)
+            diff = float(_numpy.linalg.norm(current_region - baseline_region))
+            if diff >= self._DEPLOY_THRESHOLD:
+                self.deployments.append(now)
+                self._last_deploy_time = now
+                # 3-second cooldown so one troop placement doesn't fire 5 times
+                self._cooldown_until = now + 3.0
+                # Update baseline so the troop presence doesn't re-trigger
+                self._baseline = screenshot
+
+        # --- Opponent elixir estimate ---
+        elapsed_since_deploy = now - self._last_deploy_time
+        battle_elapsed = now - (self.deployments[0] if self.deployments else now)
+        regen = (
+            self._ELIXIR_REGEN_DOUBLE
+            if battle_elapsed >= self._DOUBLE_ELIXIR_START_S
+            else self._ELIXIR_REGEN_NORMAL
+        )
+        # Clamp to 0–10; assume they spent ~4 elixir on average deployment
+        raw = (elapsed_since_deploy / regen)
+        self.opponent_elixir_estimate = min(10, int(raw))
+
+    def opponent_is_building_up(self) -> bool:
+        """True when opponent appears to have high elixir (hasn't deployed recently)."""
+        return self.opponent_elixir_estimate >= 7
+
+    def opponent_just_spent(self) -> bool:
+        """True when opponent deployed within the last 4 seconds — they're low on elixir."""
+        if not self.deployments:
+            return False
+        return (time.time() - self._last_deploy_time) <= 4.0
+
+
 def select_card_smart(
     emulator,
     card_indices: list[int],
     combat_tracker: CombatStateTracker,
     last_played: "collections.deque[int]",
+    opp_tracker: "OpponentActivityTracker | None" = None,
 ) -> tuple[int, str]:
     """Pick a card index biased toward the roles preferred in the current combat phase.
 
@@ -207,9 +311,21 @@ def select_card_smart(
     already-cached battle_iar), then selects the best role match while also avoiding
     recently played slots for variety.
 
-    Starvation prevention: any slot that has been skipped _STARVATION_LIMIT times in a
-    row is forced to play next, regardless of role, so no slot ever gets permanently
-    ignored by the role-priority loop.
+    Elixir awareness
+    ----------------
+    When our elixir is high (≥8) and the opponent just spent (is vulnerable),
+    prefer push cards regardless of the combat tracker's current mode — this is
+    the ideal window to dump a big push.
+
+    Opponent elixir awareness
+    -------------------------
+    When the opponent is building up (high elixir estimate), lean toward defense
+    and spell cards to absorb the incoming push rather than committing to a rush.
+
+    Starvation prevention
+    ----------------------
+    Any slot that has been skipped _STARVATION_LIMIT times in a row is forced to
+    play next, regardless of role, so no slot ever gets permanently ignored.
 
     Returns (card_index, card_id).
     """
@@ -226,7 +342,19 @@ def select_card_smart(
         chosen = random.choice(starved)
         return chosen, identified[chosen]
 
-    preferred = combat_tracker.preferred_roles()
+    # --- Elixir + opponent state override for role preference ---
+    our_elixir = opp_tracker.our_elixir if opp_tracker else 0
+    opp_just_spent = opp_tracker.opponent_just_spent() if opp_tracker else False
+    opp_building_up = opp_tracker.opponent_is_building_up() if opp_tracker else False
+
+    if our_elixir >= 8 and opp_just_spent:
+        # Great window to push: opponent is low, we're flush with elixir
+        preferred = ["push", "support", "spell", "defend"]
+    elif opp_building_up and combat_tracker.mode != "defend":
+        # Opponent is about to push — start leaning defensive even before they cross
+        preferred = ["defend", "spell", "support", "push"]
+    else:
+        preferred = combat_tracker.preferred_roles()
 
     # Force cycle variety: if the same card has been played 3+ consecutive times,
     # skip cards that were in the last 2 plays entirely for this round so the bot
@@ -267,6 +395,7 @@ def play_a_card_smart(
     recording_flag: bool,
     battle_strategy: "BattleStrategy",
     combat_tracker: CombatStateTracker,
+    opp_tracker: "OpponentActivityTracker | None" = None,
 ) -> bool:
     """Smart card play that uses CombatStateTracker to pick the right card for the moment.
 
@@ -274,6 +403,9 @@ def play_a_card_smart(
     - Defensive cards (buildings, swarms) when the opponent is pushing
     - Tanks and win-cons (bridge_rush / bridge_line) on a counter-push
     - Mixed push lineup when the field is quiet
+
+    Also uses opponent activity tracking and our own elixir level to refine
+    when to push vs. hold cards.
 
     Placement still uses the existing calculate_play_coords() / PLAY_COORDS system so
     each card type goes to its tuned board position.
@@ -291,11 +423,20 @@ def play_a_card_smart(
         logger.change_status("No cards ready yet...")
         return False
 
+    # Update opponent + elixir tracker before selecting a card
+    if opp_tracker is not None:
+        opp_tracker.update(emulator)
+        our_elixir = opp_tracker.our_elixir
+        opp_est = opp_tracker.opponent_elixir_estimate
+        logger.change_status(
+            f"Elixir: ours={our_elixir} | opp≈{opp_est} | mode={combat_tracker.mode}"
+        )
+
     # Now safe to read battlefield activity — battle_iar is set.
     action_offset, side = switch_side()
     combat_tracker.update(action_offset, side)
 
-    card_index, card_id = select_card_smart(emulator, card_indices, combat_tracker, last_three_cards)
+    card_index, card_id = select_card_smart(emulator, card_indices, combat_tracker, last_three_cards, opp_tracker)
     if card_index not in last_three_cards:
         last_three_cards.append(card_index)
 
@@ -900,6 +1041,10 @@ def _fight_loop(
     # Initialize counter-push combat state tracker
     combat_tracker = CombatStateTracker()
 
+    # Initialize opponent activity + elixir tracker
+    _initial_screenshot = emulator.screenshot()
+    opp_tracker = OpponentActivityTracker(_initial_screenshot) if _initial_screenshot is not None else None
+
     # Notify the adaptive learner that a new battle is starting so it can
     # track elixir choices for this game independently.
     _get_adaptive_session().start_battle()
@@ -975,7 +1120,7 @@ def _fight_loop(
             continue
 
         play_start_time = time.time()
-        if play_a_card_smart(emulator, logger, recording_flag, battle_strategy, combat_tracker) is False:
+        if play_a_card_smart(emulator, logger, recording_flag, battle_strategy, combat_tracker, opp_tracker) is False:
             logger.change_status("Failed to play a card, retrying...")
         # play_time_taken = str(time.time() - play_start_time)[:4]
         logger.change_status(

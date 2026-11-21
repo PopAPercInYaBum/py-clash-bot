@@ -248,16 +248,17 @@ def play_a_card_smart(
         logger.change_status("Hero/Champion ability ready — triggering")
         trigger_hero_champion_ability(emulator, logger)
 
-    # Read current battlefield activity and update combat phase
-    action_offset, side = switch_side()
-    combat_tracker.update(action_offset, side)
-
-    # Get available cards; check_side=True also updates the module-level play_side global
-    # so calculate_play_coords() will use the correct lane automatically.
+    # Get available cards FIRST; this sets the battle_iar global that switch_side() requires.
+    # check_side=True also updates the module-level play_side global so
+    # calculate_play_coords() will use the correct lane automatically.
     card_indices = check_which_cards_are_available(emulator, check_side=True)
     if not card_indices:
         logger.change_status("No cards ready yet...")
         return False
+
+    # Now safe to read battlefield activity — battle_iar is set.
+    action_offset, side = switch_side()
+    combat_tracker.update(action_offset, side)
 
     card_index, card_id = select_card_smart(emulator, card_indices, combat_tracker, last_three_cards)
     if card_index not in last_three_cards:

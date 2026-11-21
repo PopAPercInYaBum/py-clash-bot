@@ -334,7 +334,9 @@ class BotApplication:
         values = self.ui.get_all_values()
 
         # Create fresh multiprocessing primitives for each run
-        self.stats_queue = mp.Queue(maxsize=100)
+        # Larger queue so fast-logging states (elixir wait loop, fight loop) don't
+        # silently drop updates via put_nowait when the UI poll hasn't caught up yet.
+        self.stats_queue = mp.Queue(maxsize=500)
         self.shutdown_event = mp.Event()
         self.last_stats = {}
 

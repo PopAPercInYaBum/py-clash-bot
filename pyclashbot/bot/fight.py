@@ -394,6 +394,13 @@ def select_card_index(card_indices, last_three_cards):
 def play_a_card(emulator, logger, recording_flag: bool, battle_strategy: "BattleStrategy") -> bool:
     print("\n")
 
+    # Fire hero/champion ability opportunistically before playing a card.
+    # wait_for_elixir also does this, but if elixir was already above the target
+    # the wait loop is skipped entirely and the ability would never trigger.
+    if is_hero_champion_ability_visible(emulator):
+        logger.change_status("Hero/Champion ability ready — triggering")
+        trigger_hero_champion_ability(emulator, logger)
+
     # check which cards are available
     logger.change_status("Looking at which cards are available")
     available_card_check_start_time = time.time()
@@ -454,10 +461,14 @@ def play_a_card(emulator, logger, recording_flag: bool, battle_strategy: "Battle
 
 
 _PHASE_STRATEGIES = {
-    "early": [0, 0, 0, 0, 0.3, 0.3, 0.4],  # 0-7s: Conservative, wait for more elixir
-    "single": [0.05, 0.05, 0.1, 0.15, 0.15, 0.3, 0.2],  # 7-90s: Balanced distribution
-    "double": [0.05, 0.05, 0.1, 0.15, 0.25, 0.3, 0.1],  # 90-200s: Favor 7-8 elixir
-    "triple": [0.05, 0.05, 0.1, 0.1, 0.3, 0.4, 0],  # 200s+: Heavy favor 7-8, never 9
+    # 0-10s: Never play — let first elixir cycle build up before committing a card.
+    "early": [0, 0, 0, 0, 0, 0.5, 0.5],
+    # 10-90s (single elixir): Wait for 6-8 elixir; occasional 5 to keep pressure.
+    "single": [0, 0.05, 0.1, 0.2, 0.3, 0.3, 0.05],
+    # 90-180s (double elixir): Elixir comes faster — target 6-8 more aggressively.
+    "double": [0, 0, 0.05, 0.15, 0.3, 0.4, 0.1],
+    # 180s+ (triple elixir / sudden death): Dump everything; target 6-7 for max plays/min.
+    "triple": [0, 0, 0.05, 0.2, 0.45, 0.3, 0],
 }
 
 _PHASE_THRESHOLDS_1V1 = {
@@ -499,13 +510,20 @@ class BattleStrategy:
         return time.time() - self.start_time if self.start_time else 0
 
     def get_battle_phase(self):
-        """Determine current battle phase based on elapsed time."""
+        """Determine current battle phase based on elapsed time.
+
+        Clash Royale timing (3-minute match):
+          0-10s   → early      (let first cycle fill before spending)
+          10-90s  → single     (normal 2.8 elixir/s)
+          90-180s → double     (double elixir, 5.6 elixir/s)
+          180s+   → triple     (triple elixir / sudden death, 8.4 elixir/s)
+        """
         elapsed = self.get_elapsed_time()
-        if elapsed < 7:
+        if elapsed < 10:
             return "early"
         elif elapsed < 90:
             return "single"
-        elif elapsed < 200:
+        elif elapsed < 180:
             return "double"
         else:
             return "triple"
@@ -528,7 +546,9 @@ def _fight_loop(
     """Method for handling dynamically timed fight"""
     create_default_bridge_iar(emulator)
     _maybe_start_fight_recording(emulator, logger, recording_flag, fight_mode, custom_path)
-    collections.deque(maxlen=3)
+    # Reset the card-variety tracker at the start of every fight so we don't
+    # carry over stale history from the previous match.
+    last_three_cards.clear()
     prev_cards_played = logger.get_cards_played()
     battle_detection_lost_count = 0
 
@@ -536,7 +556,17 @@ def _fight_loop(
     battle_strategy = BattleStrategy(fight_mode)
     battle_strategy.start_battle()
 
+    # Refresh bridge_iar every N seconds so switch_side() stays accurate as
+    # troops move across the bridge during the match.
+    _BRIDGE_IAR_REFRESH_INTERVAL_S = 15
+    last_bridge_refresh = time.time()
+
     while True:
+        # Periodically refresh the bridge baseline image for side-switching accuracy.
+        if time.time() - last_bridge_refresh >= _BRIDGE_IAR_REFRESH_INTERVAL_S:
+            create_default_bridge_iar(emulator)
+            last_bridge_refresh = time.time()
+
         if not check_for_in_battle_with_delay(emulator):
             if check_if_battle_has_ended(emulator):
                 break
@@ -587,6 +617,13 @@ def _fight_loop(
                 break
 
             logger.change_status("Lost battle detection — continuing fight loop")
+            continue
+
+        # Hard early-game gate: never spend a card in the first 10 seconds no matter
+        # what wait_for_elixir returned (the PLAY_THRESHOLD path can fire early).
+        if battle_strategy.get_battle_phase() == "early":
+            logger.change_status("Early game — holding cards, waiting for elixir to build")
+            time.sleep(1)
             continue
 
         play_start_time = time.time()

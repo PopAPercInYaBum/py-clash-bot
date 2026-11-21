@@ -282,8 +282,10 @@ def state_tree(
         return state_order.next_state(state)
 
     if state == "restart":
+        # A restart is a recovery step — don't count it as a failure.
+        # add_restart_after_failure() is reserved for genuine crash/fail states
+        # so the stats panel doesn't mislead with inflated failure counts.
         logger.change_status("Restarting emulator...")
-        logger.add_restart_after_failure()
         emulator.restart()
         return state_order.next_state(state)
 

@@ -1030,7 +1030,22 @@ class MemuEmulatorController(BaseEmulatorController):
 
         Returns True once Clash Royale is on the main menu; raises
         EmulatorNotReadyError on any not-ready failure (never returns False).
+
+        Fast-path: if the VM is already running and Clash Royale is already on the
+        main menu, skip the full stop→configure→start sequence entirely. This makes
+        a huge difference on slow machines where a full cold boot takes 3-5 minutes.
         """
+        # --- Fast-path check ---
+        try:
+            reachable, _ = self.is_reachable()
+            if reachable and check_if_on_clash_main_menu(self):
+                self.logger.change_status("Emulator already running — skipping cold boot")
+                self.logger.log("[RESTART] Fast-path: Clash Royale already on main menu, skipping restart")
+                return True
+        except Exception:
+            pass  # VM not up yet — fall through to full boot
+        # --- End fast-path ---
+
         debug_restart = DEBUG_CONFIGURATION.get("restart", False)
         debug_vm_ops = DEBUG_CONFIGURATION.get("vm_operations", False)
         debug_clash = DEBUG_CONFIGURATION.get("clash_startup", False)

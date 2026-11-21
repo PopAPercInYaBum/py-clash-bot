@@ -45,11 +45,13 @@ class WorkerProcess(Process):
 
         try:
             if emulator_selection == EmulatorType.GOOGLE_PLAY:
+                logger.change_status("Setting up Google Play device...")
                 print("Creating Google Play emulator")
                 gp_device_serial = jobs.get(UIField.GP_DEVICE_SERIAL.value) or None
                 emu = controller_class(logger=logger, device_serial=gp_device_serial)
 
             elif emulator_selection == EmulatorType.BLUESTACKS:
+                logger.change_status("Setting up BlueStacks 5...")
                 print("Creating BlueStacks 5 emulator")
                 # Default: Vulkan on macOS, OpenGL on Windows
                 default_mode = "vlcn" if is_macos() else "gl"
@@ -59,16 +61,19 @@ class WorkerProcess(Process):
                 emu = controller_class(logger=logger, render_settings=render_settings, device_serial=bs_device_serial)
 
             elif emulator_selection == EmulatorType.MEMU:
+                logger.change_status("Checking MEmu installation...")
                 print("Creating MEmu emulator")
                 from pyclashbot.emulators.memu import verify_memu_installation
 
                 if not verify_memu_installation():
-                    logger.change_status("MEmu is not installed! Please install it to use MEmu Emulator Mode")
+                    logger.change_status("MEmu is not installed — install it to use MEmu Emulator Mode")
                     return None
                 render_mode = jobs.get("memu_render_mode", "opengl")
+                logger.change_status(f"Setting up MEmu ({render_mode})...")
                 emu = controller_class(logger, render_mode)
 
             elif emulator_selection == EmulatorType.ADB:
+                logger.change_status("Connecting to ADB device...")
                 print("Creating ADB Device controller")
                 adb_serial = jobs.get(UIField.ADB_SERIAL.value) or None
                 emu = controller_class(logger=logger, device_serial=adb_serial)
@@ -78,7 +83,9 @@ class WorkerProcess(Process):
 
             # Construction is cheap; restart() boots the emulator and launches Clash.
             # First-boot failure stops the bot — there is no setup retry.
+            logger.change_status("Starting emulator and launching Clash Royale...")
             emu.restart()
+            logger.change_status("Emulator ready — starting bot loop")
             return emu
 
         except EmulatorNotReadyError as e:
@@ -87,7 +94,7 @@ class WorkerProcess(Process):
             return None
         except Exception as e:
             print(f"Failed to create {emulator_selection} emulator: {e}")
-            logger.change_status(f"Failed to start {emulator_selection}. Verify its installation!")
+            logger.change_status(f"Failed to start {emulator_selection} — verify its installation.")
             return None
 
     def _run_bot_loop(self, emulator, jobs: dict[str, Any], logger: ProcessLogger) -> None:
@@ -95,47 +102,41 @@ class WorkerProcess(Process):
         state = "start"
         state_history = StateHistory(logger)
         state_order = StateOrder()
-        consecutive_restarts = 0
-        max_consecutive_restarts = 5
+        consecutive_failures = 0  # only real errors/exceptions count, not clean restarts
+        max_consecutive_failures = 5
 
         while not self.shutdown_event.is_set():
             try:
                 new_state = state_tree(emulator, logger, state, jobs, state_history, state_order)
 
-                # Check for restart loops
+                # A clean restart resets the failure streak — it is a recovery action,
+                # not a failure. Only exceptions and "fail" state count toward the limit.
                 if new_state == "restart":
-                    consecutive_restarts += 1
-                    if consecutive_restarts >= max_consecutive_restarts:
-                        logger.error(
-                            f"Too many consecutive restarts ({consecutive_restarts}) - stopping bot to prevent infinite loop"
-                        )
-                        break
-                    logger.log(f"Restart #{consecutive_restarts} - attempting to recover")
-                else:
-                    consecutive_restarts = 0  # Reset counter on successful state
-
-                # Check for error states that should stop execution
-                if new_state in ["fail", None]:
-                    logger.error(f"Critical error: state_tree returned '{new_state}' - stopping bot")
+                    logger.log(f"Restarting emulator (failure streak: {consecutive_failures})")
+                    # Don't increment consecutive_failures here — a restart is intentional.
+                elif new_state in ["fail", None]:
+                    logger.error(f"Critical error: state_tree returned '{new_state}' — stopping bot")
                     if new_state == "fail":
                         logger.add_restart_after_failure()
                     break
+                else:
+                    consecutive_failures = 0  # successful state transition — reset
 
                 state = new_state
 
             except Exception as e:
-                logger.error(f"Exception in state_tree: {e}")
-                logger.log(f"Current state was: {state}")
+                consecutive_failures += 1
+                tb = traceback.format_exc()
+                logger.error(f"Exception in state_tree ({consecutive_failures}/{max_consecutive_failures}): {e}")
+                logger.log(f"Current state was: {state}\n{tb}")
                 print(f"[ERROR] Exception in state_tree: {e}")
                 print(f"[ERROR] Current state was: {state}")
-                # Try to restart from a known state
-                state = "restart"
-                # If we keep getting exceptions, break out
                 traceback.print_exc()
-                consecutive_restarts += 1
-                if consecutive_restarts >= max_consecutive_restarts:
-                    logger.error("Too many consecutive exceptions - stopping bot")
+                if consecutive_failures >= max_consecutive_failures:
+                    logger.error("Too many consecutive exceptions — stopping bot to prevent crash loop")
                     break
+                # Recover by going back through the restart path
+                state = "restart"
 
             # Note: Pause functionality removed in multiprocessing version
             # If pause is needed, use a separate mp.Event

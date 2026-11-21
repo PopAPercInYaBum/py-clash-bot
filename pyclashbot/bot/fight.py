@@ -106,10 +106,11 @@ _DEFENSIVE_BACK_SUPPORT: frozenset[str] = frozenset({
     "bats", "evo_bats", "minions", "minion_horde", "evo_minion_horde",
     "skeleton_army", "evo_skeleton_army", "skeletons", "evo_skeletons",
     "goblins", "hero_goblins", "goblin_gang", "archers", "evo_archers",
+    "spear_goblins",  # cheap ranged defense / chip — defend role in this deck
     "valkyrie", "evo_valkyrie", "ice_wizard", "electro_wizard",
     "hunter", "evo_hunter", "wizard", "evo_wizard", "hero_wizard",
     "baby_dragon", "evo_baby_dragon", "bomber", "evo_bomber",
-    "tombstone", "hero_tombstone", "elixir_collector",
+    "elixir_collector",
     "battle_healer", "dart_goblin", "evo_dart_goblin",
     "flying_machine", "musketeer", "evo_musketeer", "hero_musketeer",
 })

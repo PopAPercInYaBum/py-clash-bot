@@ -213,6 +213,10 @@ CARD_GROUPS: dict[str, list[str]] = {
         "inferno_tower",
         "tesla",
         "evo_tesla",
+        # Tombstone moved here from back_support: center placement lets skeletons
+        # cover both lanes; defense_building coords sit between the towers.
+        "tombstone",
+        "hero_tombstone",
     ],
     "bridge_rush": [
         "battle_ram",
@@ -289,8 +293,6 @@ CARD_GROUPS: dict[str, list[str]] = {
         "skeletons",
         "evo_skeletons",
         "spear_goblins",
-        "tombstone",
-        "hero_tombstone",
         "wizard",
         "evo_wizard",
         "hero_wizard",

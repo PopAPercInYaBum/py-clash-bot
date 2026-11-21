@@ -207,10 +207,24 @@ def select_card_smart(
     already-cached battle_iar), then selects the best role match while also avoiding
     recently played slots for variety.
 
+    Starvation prevention: any slot that has been skipped _STARVATION_LIMIT times in a
+    row is forced to play next, regardless of role, so no slot ever gets permanently
+    ignored by the role-priority loop.
+
     Returns (card_index, card_id).
     """
     # Identify every available card in one pass (uses cached battle_iar — no ADB round-trip)
     identified: dict[int, str] = {idx: identify_hand_cards(emulator, idx) for idx in card_indices}
+
+    # --- Starvation override ---
+    # If any available slot has gone _STARVATION_LIMIT plays without being chosen, force it.
+    starved = [
+        idx for idx in card_indices
+        if _slot_starvation.get(idx, 0) >= _STARVATION_LIMIT
+    ]
+    if starved:
+        chosen = random.choice(starved)
+        return chosen, identified[chosen]
 
     preferred = combat_tracker.preferred_roles()
 
@@ -284,6 +298,14 @@ def play_a_card_smart(
     card_index, card_id = select_card_smart(emulator, card_indices, combat_tracker, last_three_cards)
     if card_index not in last_three_cards:
         last_three_cards.append(card_index)
+
+    # Update starvation counters: increment every available slot that was NOT chosen,
+    # and reset the chosen slot to 0.
+    for idx in card_indices:
+        if idx == card_index:
+            _slot_starvation[idx] = 0
+        else:
+            _slot_starvation[idx] = _slot_starvation.get(idx, 0) + 1
 
     role = _get_card_role(card_id)
     group = get_card_group(card_id)
@@ -664,6 +686,12 @@ def check_if_previous_game_was_win(
 # Initialize a deque with a maximum length of 3 to store the last three chosen cards
 last_three_cards = collections.deque(maxlen=3)
 
+# Starvation counter: tracks how many consecutive plays each card slot has been skipped.
+# Reset every fight. When a slot reaches _STARVATION_LIMIT it is forced to play next
+# regardless of role preference, so no slot can be permanently ignored.
+_slot_starvation: dict[int, int] = {}
+_STARVATION_LIMIT = 4
+
 
 def select_card_index(card_indices, last_three_cards):
     if not card_indices:
@@ -858,9 +886,10 @@ def _fight_loop(
     """Method for handling dynamically timed fight"""
     create_default_bridge_iar(emulator)
     _maybe_start_fight_recording(emulator, logger, recording_flag, fight_mode, custom_path)
-    # Reset the card-variety tracker at the start of every fight so we don't
-    # carry over stale history from the previous match.
+    # Reset the card-variety tracker and starvation counters at the start of every
+    # fight so we don't carry over stale history from the previous match.
     last_three_cards.clear()
+    _slot_starvation.clear()
     prev_cards_played = logger.get_cards_played()
     battle_detection_lost_count = 0
 

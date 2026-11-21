@@ -121,7 +121,6 @@ META_DECKS: list[tuple[str, list[str]]] = [
 _VISIBLE_ROWS = 4       # rows visible in the collection grid per screenshot
 _EDITOR_VISIBLE_ROWS = 3
 _MAX_SCROLL_PAGES = 10  # max scroll pages before giving up
-_SCROLL_DURATION_MS = 350
 
 # Card thumbnail half-dimensions for fingerprint corner sampling.
 # Collection thumbnails are roughly half the size of a hand card.
@@ -248,7 +247,6 @@ def scan_collection(emulator, logger: Logger) -> set[str]:
         emulator.swipe(
             DECK_BUILDER_SCROLL_START[0], DECK_BUILDER_SCROLL_START[1],
             DECK_BUILDER_SCROLL_END[0], DECK_BUILDER_SCROLL_END[1],
-            _SCROLL_DURATION_MS,
         )
         time.sleep(0.6)
 
@@ -310,7 +308,6 @@ def _find_and_click_card_in_editor(emulator, target_card: str) -> bool:
         emulator.swipe(
             DECK_BUILDER_SCROLL_START[0], DECK_BUILDER_SCROLL_START[1],
             DECK_BUILDER_SCROLL_END[0], DECK_BUILDER_SCROLL_END[1],
-            _SCROLL_DURATION_MS,
         )
         time.sleep(0.5)
 

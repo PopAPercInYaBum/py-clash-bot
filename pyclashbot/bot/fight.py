@@ -43,6 +43,7 @@ from pyclashbot.bot.state_detect import (
     check_pixels_for_win_in_battle_log,
     count_elixir,
 )
+from pyclashbot.bot.adaptive import get_session as _get_adaptive_session
 from pyclashbot.utils.logger import Logger
 from pyclashbot.utils.versioning import __version__
 
@@ -302,29 +303,34 @@ def end_fight_state(
     logger.log("Returned to main menu after fight")
     time.sleep(3)
 
-    # Determine the outcome. Force the win check when a recording is active so the
-    # pack gets a real win/loss; otherwise honor the user's win-tracker toggle.
-    if is_recording() or not disable_win_tracker_toggle:
-        win_check_return = check_if_previous_game_was_win(emulator, logger)
+    # Determine the outcome. Always check so the adaptive learner can record it;
+    # the user's win-tracker toggle only controls whether stats are incremented.
+    win_check_return = check_if_previous_game_was_win(emulator, logger)
 
-        if win_check_return == "restart":
-            logger.log("Failed while checking if previous game was a win")
-            finish_fight_recording(None)
-            return False
-
-        outcome = "win" if win_check_return else "loss"
-
-        # Only touch the user's win/loss stats when their tracker is enabled.
-        if not disable_win_tracker_toggle:
-            if win_check_return:
-                logger.add_win()
-            else:
-                logger.add_loss()
-
-        finish_fight_recording(outcome)
-    else:
-        logger.log("Not checking win/loss because check is disabled")
+    if win_check_return == "restart":
+        logger.log("Failed while checking if previous game was a win")
+        _get_adaptive_session().finish_battle(False)  # count as loss on failure
         finish_fight_recording(None)
+        return False
+
+    outcome = "win" if win_check_return else "loss"
+
+    # Feed the outcome to the adaptive learner so it can adjust weights.
+    adaptive = _get_adaptive_session()
+    adaptive.finish_battle(bool(win_check_return))
+    stats = adaptive.get_stats()
+    logger.log(
+        f"[Adaptive] game {stats['games']} | wins {stats['wins']} | win-rate {stats['win_rate']}"
+    )
+
+    # Only touch the user's win/loss stats when their tracker is enabled.
+    if not disable_win_tracker_toggle:
+        if win_check_return:
+            logger.add_win()
+        else:
+            logger.add_loss()
+
+    finish_fight_recording(outcome if (is_recording() or not disable_win_tracker_toggle) else None)
 
     return True
 
@@ -529,10 +535,26 @@ class BattleStrategy:
             return "triple"
 
     def select_elixir_amount(self):
-        """Select elixir amount to wait for based on current battle phase."""
+        """Select elixir amount to wait for based on current battle phase.
+
+        Uses adaptive learned weights when available, blended with the base
+        strategy so the bot gets smarter the more games it plays.
+        """
         phase = self.get_battle_phase()
-        weights = self.phase_strategies[phase]
-        return random.choices(self.elixir_amounts, weights=weights, k=1)[0]
+        base_weights = self.phase_strategies[phase]
+
+        # Pull learned weights from the adaptive session and blend them with
+        # the base strategy (60/40 blend so the bot stays sane early on).
+        adaptive = _get_adaptive_session()
+        learned = adaptive.get_weights(phase)
+        blended = [0.6 * b + 0.4 * l for b, l in zip(base_weights, learned)]
+
+        elixir = random.choices(self.elixir_amounts, weights=blended, k=1)[0]
+
+        # Record this play choice so the learner can credit it after the battle.
+        adaptive.record_play(phase, elixir)
+
+        return elixir
 
     def get_thresholds(self):
         """Get (WAIT_THRESHOLD, PLAY_THRESHOLD) for current battle phase."""
@@ -555,6 +577,10 @@ def _fight_loop(
     # Initialize battle strategy and start timing
     battle_strategy = BattleStrategy(fight_mode)
     battle_strategy.start_battle()
+
+    # Notify the adaptive learner that a new battle is starting so it can
+    # track elixir choices for this game independently.
+    _get_adaptive_session().start_battle()
 
     # Refresh bridge_iar every N seconds so switch_side() stays accurate as
     # troops move across the bridge during the match.

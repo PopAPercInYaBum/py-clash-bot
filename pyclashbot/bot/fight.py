@@ -50,7 +50,21 @@ from pyclashbot.bot.adaptive import get_session as _get_adaptive_session
 from pyclashbot.utils.logger import Logger
 from pyclashbot.utils.versioning import __version__
 
-ELIXIR_WAIT_TIMEOUT = 40
+ELIXIR_WAIT_TIMEOUT = 60
+
+# Elixir regeneration rates (seconds per pip)
+_ELIXIR_REGEN_NORMAL = 2.8   # single elixir phase
+_ELIXIR_REGEN_DOUBLE = 1.4   # double elixir phase (90s+)
+_ELIXIR_REGEN_TRIPLE = 0.93  # triple elixir / sudden death (180s+)
+
+
+def _elixir_regen_rate(battle_elapsed_s: float) -> float:
+    """Return seconds-per-pip for the current battle phase."""
+    if battle_elapsed_s >= 180.0:
+        return _ELIXIR_REGEN_TRIPLE
+    if battle_elapsed_s >= 90.0:
+        return _ELIXIR_REGEN_DOUBLE
+    return _ELIXIR_REGEN_NORMAL
 
 # ---------------------------------------------------------------------------
 # Elixir reading (defined here so fight.py has no new cross-module imports)
@@ -166,8 +180,11 @@ class CombatStateTracker:
     # how many push plays before we move from counter_push → push (sustained pressure)
     _COUNTER_PUSH_PLAYS = 3
     # max consecutive defensive plays before forcing a counter-push regardless of offset.
-    # prevents the bot from defending forever if the threshold never dips.
-    _MAX_DEFEND_PLAYS = 5
+    # keeps the bot from defending forever if the diff threshold never dips.
+    _MAX_DEFEND_PLAYS = 3
+    # max seconds in defend mode before forcing a counter-push regardless of pixel diff.
+    # prevents getting stuck in defend-loop when troops linger on screen for a long time.
+    _MAX_DEFEND_SECS = 12.0
 
     def __init__(self) -> None:
         # Start aggressive — take the initiative, don't wait to react
@@ -175,28 +192,30 @@ class CombatStateTracker:
         self.active_side: str = "left"
         self._defense_count: int = 0
         self._push_count: int = 0
+        self._defend_started_at: float = 0.0
 
     def update(self, action_offset: float, side: str) -> None:
         """Call at the start of each play decision with the latest switch_side() output."""
+        now = time.time()
         if action_offset >= self._PUSH_THRESHOLD:
             # Opponent is actively pushing — switch to defend if not already
             if self.mode != "defend":
                 self.mode = "defend"
                 self._defense_count = 0
                 self._push_count = 0
+                self._defend_started_at = now
             self.active_side = side
-        elif (
-            self.mode == "defend"
-            and (
-                action_offset <= self._SAFE_THRESHOLD
-                or self._defense_count >= self._MAX_DEFEND_PLAYS
-            )
-            and self._defense_count >= self._DEFENSE_PLAYS_NEEDED
-        ):
-            # Field quieted (or we've defended long enough) — time to counter-push
-            self.mode = "counter_push"
-            self.active_side = side  # push the lane we just defended
-            self._push_count = 0
+        elif self.mode == "defend":
+            time_in_defend = now - self._defend_started_at
+            force_by_time = time_in_defend >= self._MAX_DEFEND_SECS
+            force_by_count = self._defense_count >= self._MAX_DEFEND_PLAYS
+            field_quiet = action_offset <= self._SAFE_THRESHOLD
+            if (field_quiet or force_by_count or force_by_time) and self._defense_count >= self._DEFENSE_PLAYS_NEEDED:
+                # Field quieted (or we've defended long enough) — counter-push the OPPOSITE
+                # side to split the opponent's towers while their elixir is low.
+                self.mode = "counter_push"
+                self.active_side = "right" if side == "left" else "left"
+                self._push_count = 0
 
     def record_play(self, role: str) -> None:
         """Update internal counters after a card is played."""
@@ -253,14 +272,35 @@ class OpponentActivityTracker:
     _OPP_COL_START = 0
     _OPP_COL_END = 419
 
-    # L2 norm above this → opponent deployed something new
-    _DEPLOY_THRESHOLD = 12000
+    # Sum of per-pixel absolute diff (mean across channels) above this → opponent deployed.
+    # Empirically tuned: a troop placement changes ~500-2000 pixels by ~30-80 units each.
+    # At 419×230 region, ambient noise sums to ~50k; a real deploy to ~500k+.
+    _DEPLOY_THRESHOLD = 300_000
 
     # Elixir regenerates at ~1 per 2.8 s (normal), ~1 per 1.4 s (double elixir)
     _ELIXIR_REGEN_NORMAL = 2.8
     _ELIXIR_REGEN_DOUBLE = 1.4
     # Double elixir starts at t=120 s
     _DOUBLE_ELIXIR_START_S = 120.0
+
+    # Enemy card type categories (classified from deployment zone)
+    # Maps to card roles for counter selection
+    ENEMY_CARD_UNKNOWN = "unknown"
+    ENEMY_CARD_BRIDGE_RUSH = "bridge_rush"   # hog, ram, bandit — y > 220 in opp region
+    ENEMY_CARD_TANK = "tank"                 # giant, golem, pekka — x center, y 100-220
+    ENEMY_CARD_SPELL = "spell"               # fireball, lightning — large uniform diff
+    ENEMY_CARD_SUPPORT = "support"           # musketeer, wizard — y < 100 (behind tower)
+    ENEMY_CARD_BUILDING = "building"         # inferno, cannon — stationary, low motion
+
+    # Counter roles: given enemy card type, what roles to prefer
+    _COUNTER_ROLES: dict[str, list[str]] = {
+        ENEMY_CARD_BRIDGE_RUSH: ["defend", "spell", "support", "push"],
+        ENEMY_CARD_TANK: ["spell", "defend", "support", "push"],
+        ENEMY_CARD_SPELL: ["push", "support", "defend", "spell"],    # they burned elixir — push
+        ENEMY_CARD_SUPPORT: ["spell", "push", "support", "defend"],  # spell behind-tower support
+        ENEMY_CARD_BUILDING: ["spell", "push", "support", "defend"],
+        ENEMY_CARD_UNKNOWN: [],  # empty → fall through to normal logic
+    }
 
     def __init__(self, baseline_screenshot: "_numpy.ndarray") -> None:
         self._baseline = baseline_screenshot
@@ -269,12 +309,68 @@ class OpponentActivityTracker:
         self.our_elixir: int = 0
         self._last_deploy_time: float = time.time()
         self._cooldown_until: float = 0.0  # ignore detections for N seconds after one fires
+        # Enemy card detection
+        self.last_enemy_card_type: str = self.ENEMY_CARD_UNKNOWN
+        self._enemy_card_detected_at: float = 0.0
 
     def _opp_region(self, screenshot: "_numpy.ndarray") -> "_numpy.ndarray":
         return screenshot[
             self._OPP_ROW_START:self._OPP_ROW_END,
             self._OPP_COL_START:self._OPP_COL_END,
         ]
+
+    def _classify_enemy_card(self, diff_map: "_numpy.ndarray") -> str:
+        """Classify what type of card the opponent just played from pixel diff centroid.
+
+        diff_map: 2D float array (H × W) of per-pixel L1 diff magnitudes in opp region.
+        Row 0 = y=50 on screen (top of their arena), last row = y=280 (their bridge).
+
+        Zone mapping (rows within diff_map, 230 rows total):
+          0-80   → behind their tower (buildings, back-line supports)
+          80-160 → mid-field (tanks, medium troops)
+          160-230→ near their bridge (bridge rush: hog, ram, bandit)
+        """
+        h, w = diff_map.shape[:2]
+        # Only look at pixels above the threshold to find the hot zone
+        threshold = float(diff_map.max()) * 0.3
+        hot = diff_map > threshold
+        if not hot.any():
+            return self.ENEMY_CARD_UNKNOWN
+
+        rows, cols = _numpy.where(hot)
+        centroid_y = float(rows.mean())   # row in diff_map (0=their back, h=their bridge)
+        centroid_x = float(cols.mean())   # col in diff_map (0=left, w=right)
+
+        # How spread out is the diff? Wide uniform diff → spell
+        y_spread = float(rows.std()) if len(rows) > 1 else 0.0
+        x_spread = float(cols.std()) if len(cols) > 1 else 0.0
+        is_wide_diff = (x_spread > w * 0.25) and (y_spread > h * 0.15)
+
+        if is_wide_diff:
+            return self.ENEMY_CARD_SPELL
+
+        # Zone by centroid_y (normalized 0–1, 0=their back, 1=their bridge)
+        y_norm = centroid_y / h
+
+        if y_norm > 0.70:
+            # Near their bridge → bridge rush
+            return self.ENEMY_CARD_BRIDGE_RUSH
+        if y_norm < 0.35:
+            # Behind their tower → building or back-line support
+            # Distinguish by x: center → building (king tower lane), sides → support
+            x_norm = centroid_x / w
+            if 0.35 < x_norm < 0.65:
+                return self.ENEMY_CARD_BUILDING
+            return self.ENEMY_CARD_SUPPORT
+        # Mid-field → tank push
+        return self.ENEMY_CARD_TANK
+
+    def get_counter_roles(self) -> list[str]:
+        """Return preferred card roles to counter the last detected enemy card.
+        Returns [] if no recent detection or unknown type."""
+        if (time.time() - self._enemy_card_detected_at) > 8.0:
+            return []  # detection is stale — stop forcing counters
+        return self._COUNTER_ROLES.get(self.last_enemy_card_type, [])
 
     def update(self, emulator) -> None:
         """Call once per play cycle.  Takes a screenshot and updates estimates."""
@@ -286,14 +382,18 @@ class OpponentActivityTracker:
         # --- Our elixir ---
         self.our_elixir = _read_current_elixir(emulator)
 
-        # --- Opponent deployment detection ---
+        # --- Opponent deployment detection + card classification ---
         if now >= self._cooldown_until:
             current_region = self._opp_region(screenshot).astype(_numpy.float32)
             baseline_region = self._opp_region(self._baseline).astype(_numpy.float32)
-            diff = float(_numpy.linalg.norm(current_region - baseline_region))
+            diff_map = _numpy.abs(current_region - baseline_region).mean(axis=2)  # H×W
+            diff = float(diff_map.sum())
             if diff >= self._DEPLOY_THRESHOLD:
                 self.deployments.append(now)
                 self._last_deploy_time = now
+                # Classify enemy card from where the diff is hottest
+                self.last_enemy_card_type = self._classify_enemy_card(diff_map)
+                self._enemy_card_detected_at = now
                 # 3-second cooldown so one troop placement doesn't fire 5 times
                 self._cooldown_until = now + 3.0
                 # Update baseline so the troop presence doesn't re-trigger
@@ -371,9 +471,40 @@ def select_card_smart(
     opp_just_spent = opp_tracker.opponent_just_spent() if opp_tracker else False
     opp_building_up = opp_tracker.opponent_is_building_up() if opp_tracker else False
 
-    if our_elixir >= 8 and opp_just_spent:
+    # --- Enemy card counter override ---
+    # Use the detected enemy card type to pick the best counter role.
+    # This takes highest priority (after starvation) because it's the most
+    # specific signal we have about what the opponent is doing right now.
+    counter_roles = opp_tracker.get_counter_roles() if opp_tracker else []
+
+    if counter_roles:
+        # Try to find a card matching the counter role preference
+        for crole in counter_roles:
+            ccandidates = [idx for idx, cid in identified.items() if _get_card_role(cid) == crole]
+            if ccandidates:
+                chosen = random.choice(ccandidates)
+                return chosen, identified[chosen]
+        # No matching counter card in hand — fall through with counter_roles as preferred
+        preferred = counter_roles
+
+    # --- Reactive defense override ---
+    # When the opponent just deployed troops, immediately prefer a defend card so
+    # we answer the threat rather than playing a push or spell into empty air.
+    # Exception: if we're already at 8+ elixir, the opponent is now low — that's
+    # the ideal push window, so dump a push card instead of defending.
+    elif our_elixir >= 8 and opp_just_spent:
         # Great window to push: opponent is low, we're flush with elixir
         preferred = ["push", "support", "spell", "defend"]
+    elif opp_just_spent and combat_tracker.mode != "defend":
+        defend_candidates = [
+            idx for idx, cid in identified.items()
+            if _get_card_role(cid) == "defend"
+        ]
+        if defend_candidates:
+            chosen = random.choice(defend_candidates)
+            return chosen, identified[chosen]
+        # No defend card available — fall through to normal selection with defend priority
+        preferred = ["defend", "spell", "support", "push"]
     elif opp_building_up and combat_tracker.mode != "defend":
         # Opponent is about to push — start leaning defensive even before they cross
         preferred = ["defend", "spell", "support", "push"]
@@ -452,9 +583,20 @@ def play_a_card_smart(
         opp_tracker.update(emulator)
         our_elixir = opp_tracker.our_elixir
         opp_est = opp_tracker.opponent_elixir_estimate
+        enemy_card = opp_tracker.last_enemy_card_type
         logger.change_status(
-            f"Elixir: ours={our_elixir} | opp≈{opp_est} | mode={combat_tracker.mode}"
+            f"Elixir: ours={our_elixir} | opp≈{opp_est} | mode={combat_tracker.mode} | enemy={enemy_card}"
         )
+
+    # --- Hand card detection display ---
+    # Identify all hand slots and log them so the user can see what the bot detects.
+    # Uses the battle_iar already captured by check_which_cards_are_available above.
+    _detected_hand: list[str] = []
+    for _slot in range(4):
+        _cid = identify_hand_cards(emulator, _slot)
+        _role = _get_card_role(_cid)
+        _detected_hand.append(f"[{_slot}]{_cid}({_role})")
+    logger.log(f"[HAND] {' '.join(_detected_hand)}")
 
     # Now safe to read battlefield activity — battle_iar is set.
     action_offset, side = switch_side()
@@ -475,32 +617,44 @@ def play_a_card_smart(
     role = _get_card_role(card_id)
     group = get_card_group(card_id)
 
-    # For counter-push/push modes, force the card to the active side so we push
-    # the lane our defenders walked from.  For defend mode, play_side from
-    # switch_side() already points at the opponent's push lane.
     elapsed = battle_strategy.get_elapsed_time()
-    if combat_tracker.mode in ("counter_push", "push"):
-        play_coord = calculate_play_coords(group, combat_tracker.active_side, elapsed)
+
+    # --- Spell targeting: aim at the opponent troop cluster zone ---
+    # Spells played at random coords waste elixir. Instead, target the bridge
+    # approach / tower front where opponent troops reliably stack.
+    # Left lane: x≈130, right lane: x≈290. y≈300 = bridge crossing point.
+    if role == "spell":
+        spell_side = combat_tracker.active_side if combat_tracker.mode in ("counter_push", "push") else side
+        if spell_side == "left":
+            play_coord: tuple[int, int] | None = (130, 300)
+        else:
+            play_coord = (290, 300)
     else:
-        # defend — use the auto-detected side from check_which_cards_are_available
-        play_coord = calculate_play_coords(group, side, elapsed)
+        # For counter-push/push modes, force the card to the active side so we push
+        # the lane our defenders walked from.  For defend mode, play_side from
+        # switch_side() already points at the opponent's push lane.
+        if combat_tracker.mode in ("counter_push", "push"):
+            play_coord = calculate_play_coords(group, combat_tracker.active_side, elapsed)
+        else:
+            # defend — use the auto-detected side from check_which_cards_are_available
+            play_coord = calculate_play_coords(group, side, elapsed)
 
-    # Fallback: re-derive via full get_play_coords_for_card if coords came back None
-    if play_coord is None:
-        _, play_coord = get_play_coords_for_card(emulator, logger, card_index, elapsed)
+        # Fallback: re-derive via full get_play_coords_for_card if coords came back None
+        if play_coord is None:
+            _, play_coord = get_play_coords_for_card(emulator, logger, card_index, elapsed)
 
-    # In push/counter_push mode, shift back_support cards forward so they
-    # support the push from mid-field rather than sitting behind our tower.
-    # back_support coords default to y=440-456 (behind king tower); shift to
-    # y≈370-386 so musketeer/archers/etc walk into the action sooner.
-    if (
-        play_coord is not None
-        and combat_tracker.mode in ("push", "counter_push")
-        and group in ("back_support", "king_lane")
-    ):
-        x, y = play_coord
-        y = max(y - 70, 350)  # don't go above bridge line (y<300)
-        play_coord = (x, y)
+        # In push/counter_push mode, shift back_support cards forward so they
+        # support the push from mid-field rather than sitting behind our tower.
+        # back_support coords default to y=440-456 (behind king tower); shift to
+        # y≈370-386 so musketeer/archers/etc walk into the action sooner.
+        if (
+            play_coord is not None
+            and combat_tracker.mode in ("push", "counter_push")
+            and group in ("back_support", "king_lane")
+        ):
+            x, y = play_coord
+            y = max(y - 70, 350)  # don't go above bridge line (y<300)
+            play_coord = (x, y)
 
     logger.change_status(
         f"[{combat_tracker.mode.upper()}] {card_id} ({role}) → {play_coord} | "
@@ -679,6 +833,51 @@ def play_random_available_card(emulator, logger, recording_flag: bool, elapsed_s
     return True
 
 
+def _sleep_until_elixir(
+    current_elixir: int,
+    target_elixir: int,
+    battle_elapsed_s: float,
+    opp_tracker: "OpponentActivityTracker | None",
+    emulator,
+    logger,
+) -> None:
+    """Timer-based pre-sleep until target elixir is nearly ready.
+
+    Uses the deterministic elixir regen rate so the bot sleeps instead of
+    burning ADB screencaps in a poll loop.  Every 400 ms during the sleep,
+    opp_tracker.update() is called (one screencap) for reactive-defence.
+    Returns early if the opponent deploys.
+
+    After this returns, wait_for_elixir does a single confirmation screencap —
+    instead of polling for N iterations × 4 ADB calls each.
+    """
+    if current_elixir >= target_elixir:
+        return
+
+    regen = _elixir_regen_rate(battle_elapsed_s)
+    # Sleep until ~150 ms before target — close enough for a single-shot confirm.
+    sleep_s = max(0.0, (target_elixir - current_elixir) * regen - 0.15)
+    if sleep_s < 0.3:
+        # Gap too small — not worth the overhead of the timer logic.
+        return
+
+    logger.change_status(
+        f"⏱ elixir timer: {sleep_s:.2f}s until {target_elixir}e "
+        f"(current {current_elixir}e, phase {battle_elapsed_s:.0f}s)"
+    )
+    deadline = time.time() + sleep_s
+    while time.time() < deadline:
+        chunk = min(0.4, deadline - time.time())
+        if chunk > 0.05:
+            time.sleep(chunk)
+        # One screencap per chunk — keeps reactive-defence alive at ~400 ms resolution.
+        if opp_tracker is not None:
+            opp_tracker.update(emulator)
+            if opp_tracker.opponent_just_spent():
+                logger.change_status("Opponent deployed — breaking elixir timer for defence")
+                return
+
+
 def wait_for_elixir(
     emulator,
     logger,
@@ -686,6 +885,7 @@ def wait_for_elixir(
     WAIT_THRESHOLD=5000,  # noqa: N803
     PLAY_THRESHOLD=10000,  # noqa: N803
     recording_flag: bool = False,
+    opp_tracker: "OpponentActivityTracker | None" = None,
 ) -> Literal["restart", "no battle"] | bool:
     """Method to wait for 4 elixir during a battle"""
     start_time = time.time()
@@ -727,9 +927,20 @@ def wait_for_elixir(
             logger.change_status("All cards are available!")
             return True
 
+        # --- Reactive defense fast-break ---
+        # If opponent just deployed and we have any card in hand, don't sit here
+        # waiting for target elixir — play a defence card immediately.
+        if opp_tracker is not None and card_inhand > 0:
+            opp_tracker.update(emulator)
+            if opp_tracker.opponent_just_spent():
+                logger.change_status("Opponent deployed — breaking elixir wait for defence")
+                return True
+
         if wait_time > ELIXIR_WAIT_TIMEOUT:
-            logger.change_status(status="Waited too long for elixir")
-            return "restart"
+            # Timeout — don't kill the fight loop, just play whatever's available.
+            # Returning "restart" here caused the bot to abandon mid-match.
+            logger.change_status(status="Elixir wait timed out — playing anyway")
+            return True
 
         if not check_for_in_battle_with_delay(emulator):
             if check_if_battle_has_ended(emulator):
@@ -952,12 +1163,15 @@ def play_a_card(emulator, logger, recording_flag: bool, battle_strategy: "Battle
 _PHASE_STRATEGIES = {
     # 0-10s: Never play — let first elixir cycle build up before committing a card.
     "early": [0, 0, 0, 0, 0, 0.5, 0.5],
-    # 10-90s (single elixir): Wait for 6-8 elixir; occasional 5 to keep pressure.
-    "single": [0, 0.05, 0.1, 0.2, 0.3, 0.3, 0.05],
-    # 90-180s (double elixir): Elixir comes faster — target 6-8 more aggressively.
-    "double": [0, 0, 0.05, 0.15, 0.3, 0.4, 0.1],
-    # 180s+ (triple elixir / sudden death): Dump everything; target 6-7 for max plays/min.
-    "triple": [0, 0, 0.05, 0.2, 0.45, 0.3, 0],
+    # 10-90s (single elixir): Target 4-6 elixir.  Waiting for 7-8+ causes 10-16s gaps
+    # because the wait loop itself takes ~3s per iteration (3 ADB screenshots) — by
+    # targeting 4-5 the first loop iteration already finds enough elixir, cutting the
+    # outlier gaps from 15s down to the baseline ~6s play-execution time.
+    "single": [0, 0.15, 0.40, 0.30, 0.10, 0.05, 0],
+    # 90-180s (double elixir): Elixir comes in at 5.6/s — target 5-7, still fast cycles.
+    "double": [0, 0.05, 0.25, 0.40, 0.25, 0.05, 0],
+    # 180s+ (triple elixir): Full dump mode — target 5-6 for max plays per minute.
+    "triple": [0, 0.10, 0.45, 0.35, 0.10, 0, 0],
 }
 
 _PHASE_THRESHOLDS_1V1 = {
@@ -1111,6 +1325,19 @@ def _fight_loop(
         elixir_amount = battle_strategy.select_elixir_amount()
         wait_threshold, play_threshold = battle_strategy.get_thresholds()
 
+        # --- Frame-perfect timing: timer pre-sleep replaces ADB poll loop ---
+        # Sleep the calculated regen time so wait_for_elixir becomes a one-shot
+        # confirmation instead of an N-iteration polling loop.
+        if opp_tracker is not None:
+            _sleep_until_elixir(
+                opp_tracker.our_elixir,
+                elixir_amount,
+                battle_strategy.get_elapsed_time(),
+                opp_tracker,
+                emulator,
+                logger,
+            )
+
         wait_output = wait_for_elixir(
             emulator,
             logger,
@@ -1118,6 +1345,7 @@ def _fight_loop(
             wait_threshold,
             play_threshold,
             recording_flag,
+            opp_tracker=opp_tracker,
         )
 
         if wait_output == "restart":

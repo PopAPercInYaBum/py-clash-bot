@@ -488,27 +488,12 @@ def select_card_smart(
         # No matching counter card in hand — fall through with counter_roles as preferred
         preferred = counter_roles
 
-    # --- Reactive defense override ---
-    # When the opponent just deployed troops, immediately prefer a defend card so
-    # we answer the threat rather than playing a push or spell into empty air.
-    # Exception: if we're already at 8+ elixir, the opponent is now low — that's
-    # the ideal push window, so dump a push card instead of defending.
+    # --- Elixir dump window ---
+    # Only override role preference when we're flush AND opponent just spent —
+    # that's the clearest push window in the game. Everything else defers to the
+    # CombatStateTracker which uses pixel-diff to decide defend vs push.
     elif our_elixir >= 8 and opp_just_spent:
-        # Great window to push: opponent is low, we're flush with elixir
         preferred = ["push", "support", "spell", "defend"]
-    elif opp_just_spent and combat_tracker.mode != "defend":
-        defend_candidates = [
-            idx for idx, cid in identified.items()
-            if _get_card_role(cid) == "defend"
-        ]
-        if defend_candidates:
-            chosen = random.choice(defend_candidates)
-            return chosen, identified[chosen]
-        # No defend card available — fall through to normal selection with defend priority
-        preferred = ["defend", "spell", "support", "push"]
-    elif opp_building_up and combat_tracker.mode != "defend":
-        # Opponent is about to push — start leaning defensive even before they cross
-        preferred = ["defend", "spell", "support", "push"]
     else:
         preferred = combat_tracker.preferred_roles()
 

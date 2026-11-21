@@ -27,8 +27,10 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import secrets
 import shutil
+import subprocess
 import threading
 import time
 import uuid
@@ -357,11 +359,98 @@ def stop_fight_capture() -> None:
         _active.stop_capture()
 
 
+def _auto_push_recording(slug: str, pack_dir: str) -> None:
+    """Copy manifest.json + plays.jsonl into recordings/<slug>/ in the git repo
+    and push to the 'recordings' branch.  Runs in a daemon thread — never blocks
+    the bot.  Silently swallows all errors so a git hiccup can't crash the bot.
+    """
+    try:
+        # Locate repo root by walking up from this file
+        here = pathlib.Path(__file__).resolve()
+        repo_root: pathlib.Path | None = None
+        for parent in [here, *here.parents]:
+            if (parent / ".git").exists():
+                repo_root = parent
+                break
+        if repo_root is None:
+            return
+
+        BRANCH = "recordings"
+        dest = repo_root / "recordings" / slug
+        dest.mkdir(parents=True, exist_ok=True)
+
+        for fname in ("manifest.json", "plays.jsonl"):
+            src = pathlib.Path(pack_dir) / fname
+            if src.exists():
+                shutil.copy2(src, dest / fname)
+
+        def _git(*args: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                ["git", "-C", str(repo_root), *args],
+                capture_output=True, text=True, timeout=60,
+            )
+
+        # Ensure the recordings branch exists (create as orphan if not)
+        branches = _git("branch", "--list", BRANCH).stdout.strip()
+        if not branches:
+            # stash any work, create orphan branch, come back
+            _git("stash", "--include-untracked")
+            _git("checkout", "--orphan", BRANCH)
+            _git("rm", "-rf", ".")
+            _git("commit", "--allow-empty", "-m", "chore: init recordings branch")
+            _git("checkout", "-")
+            try:
+                _git("stash", "pop")
+            except Exception:
+                pass
+            _git("push", "-u", "origin", BRANCH)
+
+        # Commit only the two metadata files on the recordings branch
+        # We do this without touching the working tree of master by using
+        # git worktree or low-level plumbing to write directly to the branch.
+        # Simpler: add + commit using a temporary worktree.
+        worktree_path = repo_root / ".git" / "_rec_wt"
+        _git("worktree", "remove", "--force", str(worktree_path))  # clean stale
+        _git("worktree", "add", str(worktree_path), BRANCH)
+
+        wt_dest = worktree_path / "recordings" / slug
+        wt_dest.mkdir(parents=True, exist_ok=True)
+        for fname in ("manifest.json", "plays.jsonl"):
+            src = pathlib.Path(pack_dir) / fname
+            if src.exists():
+                shutil.copy2(src, wt_dest / fname)
+
+        subprocess.run(
+            ["git", "-C", str(worktree_path), "add", f"recordings/{slug}"],
+            capture_output=True, text=True, timeout=30,
+        )
+        subprocess.run(
+            ["git", "-C", str(worktree_path), "commit", "-m", f"recording: {slug}"],
+            capture_output=True, text=True, timeout=30,
+        )
+        subprocess.run(
+            ["git", "-C", str(worktree_path), "push", "origin", BRANCH],
+            capture_output=True, text=True, timeout=60,
+        )
+        _git("worktree", "remove", "--force", str(worktree_path))
+    except Exception:
+        pass  # never crash the bot over a recording push
+
+
 def finish_fight_recording(outcome: str | None) -> None:
     global _active
     if _active is not None:
         try:
-            _active.finish(outcome)
+            rec = _active
+            slug = rec.finish(outcome)
+            if slug is not None and rec.dir is not None:
+                t = threading.Thread(
+                    target=_auto_push_recording,
+                    args=(slug, rec.dir),
+                    daemon=True,
+                    name=f"rec-push-{slug}",
+                )
+                t.start()
         finally:
             _active = None
 

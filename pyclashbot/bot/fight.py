@@ -6,9 +6,12 @@ import time
 from typing import Literal
 
 from pyclashbot.bot.card_detection import (
+    calculate_play_coords,
     check_which_cards_are_available,
     create_default_bridge_iar,
+    get_card_group,
     get_play_coords_for_card,
+    identify_hand_cards,
     is_hero_champion_ability_visible,
     switch_side,
     trigger_hero_champion_ability,
@@ -48,6 +51,258 @@ from pyclashbot.utils.logger import Logger
 from pyclashbot.utils.versioning import __version__
 
 ELIXIR_WAIT_TIMEOUT = 40  # too high but someone got errors with that so idk
+
+# ---------------------------------------------------------------------------
+# Counter-push / combat state machine
+# ---------------------------------------------------------------------------
+
+# Card groups that are primarily defensive responses to an opponent push
+_DEFENSIVE_GROUPS: frozenset[str] = frozenset({
+    "defense_building",
+    "reactive_spell",
+    "spirit",
+})
+# Back-support cards used as defensive answers (minions, bats, skeleton army, etc.)
+_DEFENSIVE_BACK_SUPPORT: frozenset[str] = frozenset({
+    "bats", "evo_bats", "minions", "minion_horde", "evo_minion_horde",
+    "skeleton_army", "evo_skeleton_army", "skeletons", "evo_skeletons",
+    "goblins", "hero_goblins", "goblin_gang", "archers", "evo_archers",
+    "valkyrie", "evo_valkyrie", "ice_wizard", "electro_wizard",
+    "hunter", "evo_hunter", "wizard", "evo_wizard", "hero_wizard",
+    "baby_dragon", "evo_baby_dragon", "bomber", "evo_bomber",
+    "tombstone", "hero_tombstone", "elixir_collector",
+    "battle_healer", "dart_goblin", "evo_dart_goblin",
+    "flying_machine", "musketeer", "evo_musketeer", "hero_musketeer",
+})
+
+# Card groups that form the front of a push (tanks, win-cons at the bridge)
+_PUSH_GROUPS: frozenset[str] = frozenset({
+    "bridge_line",
+    "bridge_rush",
+    "miner",
+    "goblin_barrel",
+    "goblin_drill",
+    "graveyard",
+    "siege_building",
+})
+
+# Groups that provide support behind a push
+_SUPPORT_GROUPS: frozenset[str] = frozenset({
+    "back_support",
+    "king_lane",
+    "princess",
+})
+
+# Pure spell groups (don't change combat phase)
+_SPELL_GROUPS: frozenset[str] = frozenset({
+    "lane_spell",
+    "large_spell",
+    "center_spell",
+    "rocket",
+    "tornado",
+})
+
+
+def _get_card_role(card_id: str) -> str:
+    """Classify a card_id into a broad combat role used by CombatStateTracker.
+
+    Returns one of: "push", "defend", "spell", "support".
+    """
+    group = get_card_group(card_id)
+    if group in _PUSH_GROUPS:
+        return "push"
+    if group in _DEFENSIVE_GROUPS:
+        return "defend"
+    if group in _SPELL_GROUPS:
+        return "spell"
+    if group == "back_support" and card_id in _DEFENSIVE_BACK_SUPPORT:
+        return "defend"
+    return "support"
+
+
+class CombatStateTracker:
+    """Tracks the current combat phase and guides card selection.
+
+    Phases
+    ------
+    defend       — opponent is pushing; play defensive cards on the pushed lane.
+    counter_push — we just stopped a push; tank + support on the same lane.
+    push         — quiet field; take the initiative with tanks and win-cons.
+    """
+
+    # action_offset from switch_side() above this → opponent is pushing hard
+    _PUSH_THRESHOLD = 5500
+    # below this after defending → safe to counter-push
+    _SAFE_THRESHOLD = 2500
+    # how many consecutive defensive plays before we consider the push stopped
+    _DEFENSE_PLAYS_NEEDED = 2
+    # how many push plays before we move from counter_push → push (sustained pressure)
+    _COUNTER_PUSH_PLAYS = 3
+
+    def __init__(self) -> None:
+        self.mode: str = "defend"
+        self.active_side: str = "left"
+        self._defense_count: int = 0
+        self._push_count: int = 0
+
+    def update(self, action_offset: float, side: str) -> None:
+        """Call at the start of each play decision with the latest switch_side() output."""
+        if action_offset >= self._PUSH_THRESHOLD:
+            # Opponent is actively pushing — switch to defend if not already
+            if self.mode != "defend":
+                self.mode = "defend"
+                self._defense_count = 0
+                self._push_count = 0
+            self.active_side = side
+        elif (
+            self.mode == "defend"
+            and action_offset <= self._SAFE_THRESHOLD
+            and self._defense_count >= self._DEFENSE_PLAYS_NEEDED
+        ):
+            # Field quieted after we defended enough — time to counter-push
+            self.mode = "counter_push"
+            self.active_side = side  # push the lane we just defended
+            self._push_count = 0
+
+    def record_play(self, role: str) -> None:
+        """Update internal counters after a card is played."""
+        if role == "defend":
+            self._defense_count += 1
+            self._push_count = 0
+        elif role in ("push", "support"):
+            self._push_count += 1
+            self._defense_count = 0
+            if self.mode == "counter_push" and self._push_count >= self._COUNTER_PUSH_PLAYS:
+                self.mode = "push"
+        # spells: no phase change
+
+    def preferred_roles(self) -> list[str]:
+        """Return card roles in preference order for the current phase."""
+        if self.mode == "defend":
+            return ["defend", "spell", "support", "push"]
+        if self.mode == "counter_push":
+            return ["push", "support", "defend", "spell"]
+        # push
+        return ["push", "support", "spell", "defend"]
+
+
+def select_card_smart(
+    emulator,
+    card_indices: list[int],
+    combat_tracker: CombatStateTracker,
+    last_played: "collections.deque[int]",
+) -> tuple[int, str]:
+    """Pick a card index biased toward the roles preferred in the current combat phase.
+
+    Identifies all available cards (one color-fingerprint call per slot using the
+    already-cached battle_iar), then selects the best role match while also avoiding
+    recently played slots for variety.
+
+    Returns (card_index, card_id).
+    """
+    # Identify every available card in one pass (uses cached battle_iar — no ADB round-trip)
+    identified: dict[int, str] = {idx: identify_hand_cards(emulator, idx) for idx in card_indices}
+
+    preferred = combat_tracker.preferred_roles()
+
+    # Try each preferred role; prefer slots not played recently
+    for role in preferred:
+        fresh = [
+            idx for idx, cid in identified.items()
+            if _get_card_role(cid) == role and idx not in last_played
+        ]
+        if fresh:
+            chosen = random.choice(fresh)
+            return chosen, identified[chosen]
+        # Accept a recently-played slot if nothing fresher matches
+        stale = [idx for idx, cid in identified.items() if _get_card_role(cid) == role]
+        if stale:
+            chosen = random.choice(stale)
+            return chosen, identified[chosen]
+
+    # Fallback: any card not recently played, then any card
+    fresh_any = [idx for idx in card_indices if idx not in last_played]
+    chosen = random.choice(fresh_any) if fresh_any else random.choice(card_indices)
+    return chosen, identified[chosen]
+
+
+def play_a_card_smart(
+    emulator,
+    logger,
+    recording_flag: bool,
+    battle_strategy: "BattleStrategy",
+    combat_tracker: CombatStateTracker,
+) -> bool:
+    """Smart card play that uses CombatStateTracker to pick the right card for the moment.
+
+    Replaces play_a_card() in the main fight loop. Card selection is biased toward:
+    - Defensive cards (buildings, swarms) when the opponent is pushing
+    - Tanks and win-cons (bridge_rush / bridge_line) on a counter-push
+    - Mixed push lineup when the field is quiet
+
+    Placement still uses the existing calculate_play_coords() / PLAY_COORDS system so
+    each card type goes to its tuned board position.
+    """
+    # Trigger champion ability opportunistically before the main play
+    if is_hero_champion_ability_visible(emulator):
+        logger.change_status("Hero/Champion ability ready — triggering")
+        trigger_hero_champion_ability(emulator, logger)
+
+    # Read current battlefield activity and update combat phase
+    action_offset, side = switch_side()
+    combat_tracker.update(action_offset, side)
+
+    # Get available cards; check_side=True also updates the module-level play_side global
+    # so calculate_play_coords() will use the correct lane automatically.
+    card_indices = check_which_cards_are_available(emulator, check_side=True)
+    if not card_indices:
+        logger.change_status("No cards ready yet...")
+        return False
+
+    card_index, card_id = select_card_smart(emulator, card_indices, combat_tracker, last_three_cards)
+    if card_index not in last_three_cards:
+        last_three_cards.append(card_index)
+
+    role = _get_card_role(card_id)
+    group = get_card_group(card_id)
+
+    # For counter-push/push modes, force the card to the active side so we push
+    # the lane our defenders walked from.  For defend mode, play_side from
+    # switch_side() already points at the opponent's push lane.
+    elapsed = battle_strategy.get_elapsed_time()
+    if combat_tracker.mode in ("counter_push", "push"):
+        play_coord = calculate_play_coords(group, combat_tracker.active_side, elapsed)
+    else:
+        # defend — use the auto-detected side from check_which_cards_are_available
+        play_coord = calculate_play_coords(group, side, elapsed)
+
+    # Fallback: re-derive via full get_play_coords_for_card if coords came back None
+    if play_coord is None:
+        _, play_coord = get_play_coords_for_card(emulator, logger, card_index, elapsed)
+
+    logger.change_status(
+        f"[{combat_tracker.mode.upper()}] {card_id} ({role}) → {play_coord} | "
+        f"offset={int(action_offset)} side={side}"
+    )
+
+    # Click the card then the board position
+    emulator.click(HAND_CARDS_COORDS[card_index][0], HAND_CARDS_COORDS[card_index][1])
+    if play_coord is None:
+        logger.change_status("Non-fatal: play coord is None — skipping play")
+        return False
+    emulator.click(play_coord[0], play_coord[1])
+
+    combat_tracker.record_play(role)
+
+    if recording_flag:
+        log_play(card_index, play_coord[0], play_coord[1], elapsed)
+
+    logger.add_card_played()
+
+    if random.randint(0, 9) == 1:
+        send_emote(emulator, logger)
+
+    return True
 ABILITY_TRIGGER_DELAY_S = 3
 
 
@@ -578,6 +833,9 @@ def _fight_loop(
     battle_strategy = BattleStrategy(fight_mode)
     battle_strategy.start_battle()
 
+    # Initialize counter-push combat state tracker
+    combat_tracker = CombatStateTracker()
+
     # Notify the adaptive learner that a new battle is starting so it can
     # track elixir choices for this game independently.
     _get_adaptive_session().start_battle()
@@ -653,7 +911,7 @@ def _fight_loop(
             continue
 
         play_start_time = time.time()
-        if play_a_card(emulator, logger, recording_flag, battle_strategy) is False:
+        if play_a_card_smart(emulator, logger, recording_flag, battle_strategy, combat_tracker) is False:
             logger.change_status("Failed to play a card, retrying...")
         # play_time_taken = str(time.time() - play_start_time)[:4]
         logger.change_status(

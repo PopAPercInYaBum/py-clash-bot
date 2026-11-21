@@ -333,51 +333,61 @@ class GooglePlayEmulatorController(AdbBasedController):
         self.adb(f"shell wm size {width}x{height}")
 
     def restart(self):
-        # Fast-path: if the emulator process is already up and Clash Royale is on the
-        # main menu, skip the entire stop→configure→start→wait sequence. This matters
-        # on slow machines where a cold boot can take several minutes.
+        # Fast-path: if the emulator process is already up, skip the stop step entirely
+        # and go straight to waiting for the main menu. On a slow machine, shutting down
+        # and rebooting the emulator can take 3-5 minutes — if it's already running,
+        # just relaunch Clash and wait for the menu.
+        emulator_already_up = False
         try:
-            if self._is_emulator_running() and check_if_on_clash_main_menu(self):
-                self.logger.change_status("Emulator already running — skipping cold boot")
-                self.logger.log("[RESTART] Fast-path: Clash Royale already on main menu, skipping restart")
-                return True
+            if self._is_emulator_running():
+                emulator_already_up = True
+                self.logger.change_status("Emulator already running — checking if Clash is ready...")
+                self.logger.log("[RESTART] Emulator process already running, skipping cold boot")
+                # If Clash is already on the main menu, skip everything
+                if check_if_on_clash_main_menu(self):
+                    self.logger.change_status("Clash Royale already on main menu — skipping restart")
+                    self.logger.log("[RESTART] Fast-path: Clash already on main menu")
+                    return True
         except Exception:
-            pass  # emulator not reachable yet — fall through to full boot
+            emulator_already_up = False
 
         restart_start_time = time.time()
 
         self.logger.change_status("Starting Google Play emulator restart process...")
 
-        # close emulator
-        self.logger.change_status("Shutting down Google Play emulator processes...")
-        print("Restarting emulator...")
-        print("Closing emulator...")
-        while self._is_emulator_running():
-            self.stop()
+        # close emulator only if it wasn't already running
+        if not emulator_already_up:
+            self.logger.change_status("Shutting down Google Play emulator processes...")
+            print("Restarting emulator...")
+            print("Closing emulator...")
+            while self._is_emulator_running():
+                self.stop()
 
         # write render settings to the XML config while the emulator is stopped
-        self._configure_settings(self.render_settings)
+        if not emulator_already_up:
+            self._configure_settings(self.render_settings)
 
-        # boot emulator
-        self.logger.change_status("Starting Google Play emulator...")
-        print("Starting emulator...")
-        boot_deadline = time.time() + 120
-        while not self._is_emulator_running():
-            if time.time() > boot_deadline:
-                self.logger.change_status("Timed out waiting for the Google Play emulator process to start.")
-                raise EmulatorNotReadyError("Google Play restart() timed out waiting for the emulator to start")
-            self.start()
-            print("Waiting for google play emulator to start...")
-            time.sleep(0.3)
+        # boot emulator (skip if already running)
+        if not emulator_already_up:
+            self.logger.change_status("Starting Google Play emulator...")
+            print("Starting emulator...")
+            boot_deadline = time.time() + 120
+            while not self._is_emulator_running():
+                if time.time() > boot_deadline:
+                    self.logger.change_status("Timed out waiting for the Google Play emulator process to start.")
+                    raise EmulatorNotReadyError("Google Play restart() timed out waiting for the emulator to start")
+                self.start()
+                print("Waiting for google play emulator to start...")
+                time.sleep(0.3)
 
-        # wait for adb readiness (locale-agnostic) once the VM process is up
-        self.logger.change_status("Waiting for Google Play emulator to finish starting...")
-        if not self._wait_for_adb_ready(timeout=120):
-            self.logger.change_status("Timed out waiting for Google Play emulator ADB to become ready.")
-            raise EmulatorNotReadyError("Google Play restart() timed out waiting for ADB to become ready")
+            # wait for adb readiness (locale-agnostic) once the VM process is up
+            self.logger.change_status("Waiting for Google Play emulator to finish starting...")
+            if not self._wait_for_adb_ready(timeout=120):
+                self.logger.change_status("Timed out waiting for Google Play emulator ADB to become ready.")
+                raise EmulatorNotReadyError("Google Play restart() timed out waiting for ADB to become ready")
 
-        # Allow emulator services/UI to settle before manipulating display or launching the app.
-        time.sleep(5)
+            # Allow emulator services/UI to settle before manipulating display or launching the app.
+            time.sleep(5)
 
         self.logger.change_status(f"Setting emulator screen size to {self.expected_dims}...")
         for i in range(3):

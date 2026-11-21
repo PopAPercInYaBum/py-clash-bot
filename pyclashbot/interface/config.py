@@ -160,6 +160,12 @@ JOBS = [
         tooltip="Play Trophy Road 1v1 battles.",
     ),
     JobConfig(
+        UIField.DECK_BUILDER_USER_TOGGLE,
+        "🏗️ Build best deck",
+        default=False,
+        tooltip="Scan your card collection and auto-equip the best meta deck you own before each bot loop.",
+    ),
+    JobConfig(
         UIField.RANDOM_DECKS_USER_TOGGLE,
         "🎲 Randomize deck",
         default=False,

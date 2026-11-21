@@ -136,6 +136,7 @@ START_JOB_GROUPS: tuple[tuple[UIField, ...], ...] = (
         UIField.CARD_MASTERY_USER_TOGGLE,
         UIField.SHOP_DAILY_OFFER_USER_TOGGLE,
     ),
+    (UIField.DECK_BUILDER_USER_TOGGLE,),
 )
 
 

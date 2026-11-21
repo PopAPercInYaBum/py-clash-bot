@@ -214,19 +214,31 @@ def select_card_smart(
 
     preferred = combat_tracker.preferred_roles()
 
+    # Force cycle variety: if the same card has been played 3+ consecutive times,
+    # skip cards that were in the last 2 plays entirely for this round so the bot
+    # doesn't just hammer one card repeatedly.
+    recently_played = set(list(last_played)[-2:]) if len(last_played) >= 2 else set()
+    force_variety = len(last_played) >= 3 and len(set(last_played)) == 1  # all same card
+
     # Try each preferred role; prefer slots not played recently
     for role in preferred:
-        fresh = [
+        candidates = [
             idx for idx, cid in identified.items()
-            if _get_card_role(cid) == role and idx not in last_played
+            if _get_card_role(cid) == role
         ]
+        # In forced-variety mode, skip recently played slots; fall back if no other options
+        fresh = [idx for idx in candidates if idx not in last_played]
+        if force_variety:
+            very_fresh = [idx for idx in candidates if idx not in recently_played]
+            if very_fresh:
+                chosen = random.choice(very_fresh)
+                return chosen, identified[chosen]
         if fresh:
             chosen = random.choice(fresh)
             return chosen, identified[chosen]
         # Accept a recently-played slot if nothing fresher matches
-        stale = [idx for idx, cid in identified.items() if _get_card_role(cid) == role]
-        if stale:
-            chosen = random.choice(stale)
+        if candidates:
+            chosen = random.choice(candidates)
             return chosen, identified[chosen]
 
     # Fallback: any card not recently played, then any card

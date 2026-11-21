@@ -41,7 +41,6 @@ class UIField(StrEnum):
     CARD_UPGRADE_USER_TOGGLE = "card_upgrade_user_toggle"
     UPGRADE_PRINCESS_USER_TOGGLE = "upgrade_princess_user_toggle"
     RANDOM_DECKS_USER_TOGGLE = "random_decks_user_toggle"
-    DECK_BUILDER_USER_TOGGLE = "deck_builder_user_toggle"
     DECK_NUMBER_SELECTION = "deck_number_selection"
     CYCLE_DECKS_USER_TOGGLE = "cycle_decks_user_toggle"
     MAX_DECK_SELECTION = "max_deck_selection"
@@ -136,7 +135,6 @@ START_JOB_GROUPS: tuple[tuple[UIField, ...], ...] = (
         UIField.CARD_MASTERY_USER_TOGGLE,
         UIField.SHOP_DAILY_OFFER_USER_TOGGLE,
     ),
-    (UIField.DECK_BUILDER_USER_TOGGLE,),
 )
 
 

@@ -7,7 +7,6 @@ from pyclashbot.bot.account_switch import switch_account_state
 from pyclashbot.bot.card_mastery_state import card_mastery_state
 from pyclashbot.bot.clan_chat_state import clan_chat_state
 from pyclashbot.bot.deck import randomize_deck_state, select_deck_state
-from pyclashbot.bot.deck_builder import run_deck_builder
 from pyclashbot.bot.fight import (
     do_fight_state,
     end_fight_state,
@@ -219,7 +218,6 @@ class StateOrder:
             "shop_daily",
             "clan_chat",
             "war",
-            "build_deck",
             "select_battle_mode",
             "randomize_deck",
             "cycle_deck",
@@ -308,16 +306,6 @@ def state_tree(
             return state_order.next_state(state)
 
         return handle_state_failure(logger, "switch_account", "switch_account_state")
-
-    if state == "build_deck":
-        if not job_list.get(UIField.DECK_BUILDER_USER_TOGGLE.value, False):
-            logger.log("Deck builder isn't toggled — skipping")
-            return state_order.next_state(state)
-
-        # Deck builder failure is non-fatal — bad scan or missing cards just means
-        # we skip equipping and continue the loop normally.
-        run_deck_builder(emulator, logger)
-        return state_order.next_state(state)
 
     if state == "randomize_deck":
         # if randomize deck isn't toggled, return next state

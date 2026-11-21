@@ -91,7 +91,6 @@ _JOB_TAB_COLUMNS: tuple[tuple[tuple[str, tuple[UIField, ...]], ...], ...] = (
         (
             "Decks",
             (
-                UIField.DECK_BUILDER_USER_TOGGLE,
                 UIField.RANDOM_DECKS_USER_TOGGLE,
                 UIField.CYCLE_DECKS_USER_TOGGLE,
                 UIField.RANDOM_PLAYS_USER_TOGGLE,

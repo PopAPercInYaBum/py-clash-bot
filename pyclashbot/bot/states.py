@@ -219,8 +219,8 @@ class StateOrder:
             "shop_daily",
             "clan_chat",
             "war",
-            "select_battle_mode",
             "build_deck",
+            "select_battle_mode",
             "randomize_deck",
             "cycle_deck",
             "start_fight",
@@ -310,7 +310,7 @@ def state_tree(
         return handle_state_failure(logger, "switch_account", "switch_account_state")
 
     if state == "build_deck":
-        if not job_list.get(UIField.DECK_BUILDER_USER_TOGGLE, False):
+        if not job_list.get(UIField.DECK_BUILDER_USER_TOGGLE.value, False):
             logger.log("Deck builder isn't toggled — skipping")
             return state_order.next_state(state)
 
@@ -434,9 +434,6 @@ def state_tree(
         request = job_list.get(UIField.CLAN_REQUEST_CARDS_USER_TOGGLE.value, False)
         if not donate and not claim and not request:
             logger.log("No clan actions selected. Skipping this state")
-            if not any_fight_mode_enabled(job_list):
-                logger.log("No fight modes enabled, skipping fight chain")
-                return state_order.next_state("end_fight")
             return state_order.next_state(state)
 
         if clan_chat_state(
@@ -446,9 +443,6 @@ def state_tree(
             claim_enabled=claim,
             request_enabled=request,
         ):
-            if not any_fight_mode_enabled(job_list):
-                logger.log("No fight modes enabled, skipping fight chain")
-                return state_order.next_state("end_fight")
             return state_order.next_state(state)
 
         return handle_state_failure(logger, "clan_chat", "clan_chat_state")
@@ -456,15 +450,9 @@ def state_tree(
     if state == "war":
         if not job_list.get(UIField.WAR_USER_TOGGLE.value, False):
             logger.log("War job isn't toggled. Skipping this state")
-            if not any_fight_mode_enabled(job_list):
-                logger.log("No fight modes enabled, skipping fight chain")
-                return state_order.next_state("end_fight")
             return state_order.next_state(state)
 
         if war_state(emulator, logger):
-            if not any_fight_mode_enabled(job_list):
-                logger.log("No fight modes enabled, skipping fight chain")
-                return state_order.next_state("end_fight")
             return state_order.next_state(state)
         return handle_state_failure(logger, "war", "war_state")
 

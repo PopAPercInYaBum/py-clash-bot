@@ -130,17 +130,23 @@ class CombatStateTracker:
     push         — quiet field; take the initiative with tanks and win-cons.
     """
 
-    # action_offset from switch_side() above this → opponent is pushing hard
-    _PUSH_THRESHOLD = 5500
-    # below this after defending → safe to counter-push
-    _SAFE_THRESHOLD = 2500
+    # action_offset from switch_side() above this → opponent is pushing hard.
+    # Calibrated from real game logs: normal background noise is 15k–23k,
+    # so a genuine heavy push registers well above that.
+    _PUSH_THRESHOLD = 28000
+    # below this after defending → field has quieted enough to counter-push
+    _SAFE_THRESHOLD = 18000
     # how many consecutive defensive plays before we consider the push stopped
     _DEFENSE_PLAYS_NEEDED = 2
     # how many push plays before we move from counter_push → push (sustained pressure)
     _COUNTER_PUSH_PLAYS = 3
+    # max consecutive defensive plays before forcing a counter-push regardless of offset.
+    # prevents the bot from defending forever if the threshold never dips.
+    _MAX_DEFEND_PLAYS = 5
 
     def __init__(self) -> None:
-        self.mode: str = "defend"
+        # Start aggressive — take the initiative, don't wait to react
+        self.mode: str = "push"
         self.active_side: str = "left"
         self._defense_count: int = 0
         self._push_count: int = 0
@@ -156,10 +162,13 @@ class CombatStateTracker:
             self.active_side = side
         elif (
             self.mode == "defend"
-            and action_offset <= self._SAFE_THRESHOLD
+            and (
+                action_offset <= self._SAFE_THRESHOLD
+                or self._defense_count >= self._MAX_DEFEND_PLAYS
+            )
             and self._defense_count >= self._DEFENSE_PLAYS_NEEDED
         ):
-            # Field quieted after we defended enough — time to counter-push
+            # Field quieted (or we've defended long enough) — time to counter-push
             self.mode = "counter_push"
             self.active_side = side  # push the lane we just defended
             self._push_count = 0

@@ -333,6 +333,17 @@ class GooglePlayEmulatorController(AdbBasedController):
         self.adb(f"shell wm size {width}x{height}")
 
     def restart(self):
+        # Fast-path: if the emulator process is already up and Clash Royale is on the
+        # main menu, skip the entire stop→configure→start→wait sequence. This matters
+        # on slow machines where a cold boot can take several minutes.
+        try:
+            if self._is_emulator_running() and check_if_on_clash_main_menu(self):
+                self.logger.change_status("Emulator already running — skipping cold boot")
+                self.logger.log("[RESTART] Fast-path: Clash Royale already on main menu, skipping restart")
+                return True
+        except Exception:
+            pass  # emulator not reachable yet — fall through to full boot
+
         restart_start_time = time.time()
 
         self.logger.change_status("Starting Google Play emulator restart process...")
@@ -400,8 +411,8 @@ class GooglePlayEmulatorController(AdbBasedController):
         self.logger.change_status("Waiting for Clash Royale main menu to load...")
         print("Waiting for CR main menu")
         clash_main_wait_start_time = time.time()
-        clash_main_wait_timeout = 240  # s
-        time.sleep(12)
+        clash_main_wait_timeout = 480  # s — raised for slow machines
+        time.sleep(20)
         while 1:
             if time.time() - clash_main_wait_start_time > clash_main_wait_timeout:
                 self.logger.change_status("Timeout waiting for Clash Royale main menu")

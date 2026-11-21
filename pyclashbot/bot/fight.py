@@ -45,13 +45,37 @@ from pyclashbot.bot.state_detect import (
     check_if_on_clash_main_menu,
     check_pixels_for_win_in_battle_log,
     count_elixir,
-    read_current_elixir,
 )
 from pyclashbot.bot.adaptive import get_session as _get_adaptive_session
 from pyclashbot.utils.logger import Logger
 from pyclashbot.utils.versioning import __version__
 
-ELIXIR_WAIT_TIMEOUT = 40  # too high but someone got errors with that so idk
+ELIXIR_WAIT_TIMEOUT = 40
+
+# ---------------------------------------------------------------------------
+# Elixir reading (defined here so fight.py has no new cross-module imports)
+# ---------------------------------------------------------------------------
+_ELIXIR_COORDS = [
+    [613, 149], [613, 165], [613, 188], [613, 212], [613, 240],
+    [613, 262], [613, 287], [613, 314], [613, 339], [613, 364],
+]
+_ELIXIR_COLOR = [240, 137, 244]
+
+
+def _read_current_elixir(emulator) -> int:
+    """Return actual elixir count (0–10) by scanning all 10 pip pixels."""
+    try:
+        from pyclashbot.detection.image_rec import pixel_is_equal
+        iar = emulator.screenshot()
+        if iar is None:
+            return 0
+        for level in range(10, 0, -1):
+            row, col = _ELIXIR_COORDS[level - 1]
+            if pixel_is_equal(iar[row, col], _ELIXIR_COLOR, tol=65):
+                return level
+    except Exception:  # noqa: BLE001
+        pass
+    return 0  # too high but someone got errors with that so idk
 
 # ---------------------------------------------------------------------------
 # Counter-push / combat state machine
@@ -260,7 +284,7 @@ class OpponentActivityTracker:
             return
 
         # --- Our elixir ---
-        self.our_elixir = read_current_elixir(emulator)
+        self.our_elixir = _read_current_elixir(emulator)
 
         # --- Opponent deployment detection ---
         if now >= self._cooldown_until:

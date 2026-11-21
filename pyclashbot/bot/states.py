@@ -314,10 +314,10 @@ def state_tree(
             logger.log("Deck builder isn't toggled — skipping")
             return state_order.next_state(state)
 
-        if run_deck_builder(emulator, logger):
-            return state_order.next_state(state)
-
-        return handle_state_failure(logger, "build_deck", "run_deck_builder")
+        # Deck builder failure is non-fatal — bad scan or missing cards just means
+        # we skip equipping and continue the loop normally.
+        run_deck_builder(emulator, logger)
+        return state_order.next_state(state)
 
     if state == "randomize_deck":
         # if randomize deck isn't toggled, return next state

@@ -405,18 +405,18 @@ class GooglePlayEmulatorController(AdbBasedController):
             )
             raise EmulatorNotReadyError(f"Google Play restart() could not set screen size to {self.expected_dims}")
 
-        # boot clash — only launch once if emulator was already running
+        # boot clash
         self.logger.change_status("Launching Clash Royale application...")
         if not emulator_already_up:
             time.sleep(10)
         clash_royale_name = CLASH_ROYALE_PACKAGE
-        start_app_count = 1 if emulator_already_up else 3
+        start_app_count = 3
         for i in range(start_app_count):
             self.logger.change_status(f"Starting Clash Royale (attempt {i + 1}/{start_app_count})...")
             print(f"Starting clash app (attempt {i + 1}/{start_app_count})...")
             # start_app raises EmulatorNotReadyError if Clash Royale isn't installed
             self.start_app(clash_royale_name)
-            time.sleep(3)
+            time.sleep(1)
 
         # wait for clash main to appear
         self.logger.change_status("Waiting for Clash Royale main menu to load...")
@@ -443,8 +443,9 @@ class GooglePlayEmulatorController(AdbBasedController):
                 time.sleep(2)
                 continue
 
-            # small sleep to avoid hammering the screen
-            time.sleep(2)
+            # click deadspace to dismiss popups, but only after a short wait
+            time.sleep(1)
+            self.click(35, 405)
 
         restart_duration = str(time.time() - restart_start_time)[:5]
         self.logger.change_status(f"Google Play emulator restart completed successfully in {restart_duration}s")

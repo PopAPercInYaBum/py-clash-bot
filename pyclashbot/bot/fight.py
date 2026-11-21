@@ -290,6 +290,19 @@ def play_a_card_smart(
     if play_coord is None:
         _, play_coord = get_play_coords_for_card(emulator, logger, card_index, elapsed)
 
+    # In push/counter_push mode, shift back_support cards forward so they
+    # support the push from mid-field rather than sitting behind our tower.
+    # back_support coords default to y=440-456 (behind king tower); shift to
+    # y≈370-386 so musketeer/archers/etc walk into the action sooner.
+    if (
+        play_coord is not None
+        and combat_tracker.mode in ("push", "counter_push")
+        and group in ("back_support", "king_lane")
+    ):
+        x, y = play_coord
+        y = max(y - 70, 350)  # don't go above bridge line (y<300)
+        play_coord = (x, y)
+
     logger.change_status(
         f"[{combat_tracker.mode.upper()}] {card_id} ({role}) → {play_coord} | "
         f"offset={int(action_offset)} side={side}"
